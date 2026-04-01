@@ -3,3 +3,4 @@ node_modules
 uploads
 test_video
 output
+.env.example

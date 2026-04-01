@@ -1,0 +1,19 @@
+{
+  "name": "video-worker",
+  "version": "1.0.0",
+  "description": "SQS polling worker: downloads raw video from S3, transcodes to HLS with FFmpeg, uploads to processed bucket",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "dotenv": "^16.0.0",
+    "uuid": "^11.0.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

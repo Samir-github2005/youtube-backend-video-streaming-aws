@@ -6,7 +6,7 @@ import multer from "multer";
 import multerS3 from "multer-s3";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
-import { S3Client } from "@aws-sdk/client-s3";
+import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 
 const app = express();
@@ -90,6 +90,27 @@ app.post("/upload", (req, res) => {
             s3Url,
         });
     });
+});
+
+app.get('/status/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+
+  try {
+    await s3.send(new HeadObjectCommand({
+      Bucket: process.env.S3_PROCESSED_BUCKET,
+      Key: `hls/${videoId}/index.m3u8`
+    }));
+
+    // file exists → processing is done
+    res.json({ status: 'ready' });
+
+  } catch (err) {
+    if (err.name === 'NotFound') {
+      res.json({ status: 'processing' });
+    } else {
+      res.status(500).json({ status: 'failed' });
+    }
+  }
 });
 
 app.listen(PORT, () => {

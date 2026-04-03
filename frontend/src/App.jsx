@@ -1,31 +1,97 @@
-import './App.css'
-import { useRef } from 'react'
-import VideoPlayer from './VideoPlayer.jsx'
+// App.jsx
+import { useState } from 'react';
+import VideoPlayer from './VideoPlayer';
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
+const CF_URL = import.meta.env.VITE_CLOUDFRONT_URL;
+
+export default function App() {
+  const [videoId, setVideoId] = useState(null);
+  const [status, setStatus] = useState('idle'); // idle | uploading | processing | ready | error
+  const [error, setError] = useState(null);
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setStatus('uploading');
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await fetch(`${BACKEND_URL}/upload`, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!res.ok) throw new Error('Upload failed');
+
+      const data = await res.json();
+      setVideoId(data.videoId);
+      setStatus('processing');
+
+      // poll backend every 5 seconds to check if HLS is ready
+      pollStatus(data.videoId);
 
 
-function App() {
-
-  const playerRef= useRef(null)
-  const videoLink= "http://localhost:3000/output/a1378075-31a2-4f96-8fdb-8dd80e71d720/index.m3u8"
-
-  const handlePlayerReady = (player) => {
-    playerRef.current = player;
+    } catch (err) {
+      setError(err.message);
+      setStatus('error');
+    }
   };
-  const VideoPlayerOptions= {
-    controls: true,
-    autoplay: true,
-    sources: [
-      {
-        src: videoLink,
-        type: "application/x-mpegURL",
-      },
-    ],
+
+  const pollStatus = (id) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/status/${id}`);
+        const data = await res.json();
+
+        if (data.status === 'ready') {
+          clearInterval(interval);
+          setStatus('ready');
+        } else if (data.status === 'failed') {
+          clearInterval(interval);
+          setStatus('error');
+          setError('Processing failed');
+        }
+      } catch {
+        clearInterval(interval);
+      }
+    }, 5000);
   };
+
+  const hlsUrl = videoId
+    ? `${CF_URL}/hls/${videoId}/index.m3u8`
+    : null;
+
   return (
-    <>
-     <VideoPlayer options={VideoPlayerOptions} onReady={handlePlayerReady} />
-    </>
-  )
-}
+    <div style={{ maxWidth: 800, margin: '40px auto', padding: '0 20px' }}>
+      <h2>Video Streaming Pipeline</h2>
 
-export default App
+      <input
+        type="file"
+        accept="video/*"
+        onChange={handleUpload}
+        disabled={status === 'uploading' || status === 'processing'}
+      />
+
+      {status === 'uploading' && <p>Uploading to S3...</p>}
+      {status === 'processing' && <p>Processing video... this takes a minute</p>}
+      {status === 'error' && <p style={{ color: 'red' }}>{error}</p>}
+
+      {status === 'ready' && hlsUrl && (
+        <VideoPlayer
+          options={{
+            controls: true,
+            autoplay: true,
+            responsive: true,
+            fluid: true,
+            sources: [{ src: hlsUrl, type: 'application/x-mpegURL' }],
+          }}
+        />
+      )}
+    </div>
+  );
+}

@@ -98,7 +98,7 @@ app.get('/status/:videoId', async (req, res) => {
   try {
     await s3.send(new HeadObjectCommand({
       Bucket: process.env.S3_PROCESSED_BUCKET,
-      Key: `hls/${videoId}/index.m3u8`
+      Key: `hls/${videoId}/master.m3u8`
     }));
 
     // file exists → processing is done

@@ -63,7 +63,7 @@ export default function App() {
   };
 
   const hlsUrl = videoId
-    ? `${CF_URL}/hls/${videoId}/index.m3u8`
+    ? `${CF_URL}/hls/${videoId}/master.m3u8`
     : null;
 
   return (

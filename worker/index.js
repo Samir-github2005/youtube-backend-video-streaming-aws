@@ -22,6 +22,34 @@ const QUEUE_URL = process.env.SQS_QUEUE_URL;
 const RAW_BUCKET = process.env.S3_RAW_BUCKET;
 const PROCESSED_BUCKET = process.env.S3_PROCESSED_BUCKET;
 
+// ─── Quality profiles ───────────────────────────────────────────────────────
+// Each profile defines the FFmpeg output settings and the folder name in S3.
+// BANDWIDTH is used in the master playlist (bits per second).
+
+const QUALITIES = [
+    {
+        label: "480p",
+        resolution: "854x480",
+        videoBitrate: "800k",
+        audioBitrate: "96k",
+        bandwidth: 896000,       // videoBitrate + audioBitrate in bps
+    },
+    {
+        label: "720p",
+        resolution: "1280x720",
+        videoBitrate: "2500k",
+        audioBitrate: "128k",
+        bandwidth: 2628000,
+    },
+    {
+        label: "1080p",
+        resolution: "1920x1080",
+        videoBitrate: "5000k",
+        audioBitrate: "192k",
+        bandwidth: 5192000,
+    },
+];
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /** Download an S3 object to a local file path */
@@ -43,7 +71,6 @@ async function uploadDirectoryToS3(localDir, bucket, s3Prefix) {
         const fileBody = fs.readFileSync(filePath);
         const s3Key = `${s3Prefix}/${file}`;
 
-        // Pick the right content-type
         const contentType = file.endsWith(".m3u8")
             ? "application/x-mpegURL"
             : "video/mp2t";
@@ -58,30 +85,55 @@ async function uploadDirectoryToS3(localDir, bucket, s3Prefix) {
     }
 }
 
-/** Transcode a video file to HLS segments using FFmpeg */
-async function transcodeToHLS(inputPath, outputDir) {
-    await fs.promises.mkdir(outputDir, { recursive: true });
-    const hlsPath = path.join(outputDir, "index.m3u8");
-    const segmentPattern = path.join(outputDir, "segment%03d.ts");
+/**
+ * Transcode a single quality rendition to HLS using FFmpeg.
+ * Output goes to: outputDir/<label>/index.m3u8 + segment*.ts
+ */
+async function transcodeQuality(inputPath, outputDir, quality) {
+    const { label, resolution, videoBitrate, audioBitrate } = quality;
+    const qualityDir = path.join(outputDir, label);
+    await fs.promises.mkdir(qualityDir, { recursive: true });
+
+    const hlsPath = path.join(qualityDir, "index.m3u8");
+    const segmentPattern = path.join(qualityDir, "segment%03d.ts");
 
     const cmd = [
         "ffmpeg",
         "-i", `"${inputPath}"`,
-        "-codec:v", "libx264",
-        "-codec:a", "aac",
+        "-vf", `scale=${resolution}`,   // force exact resolution
+        "-c:v", "libx264",
+        "-b:v", videoBitrate,
+        "-c:a", "aac",
+        "-b:a", audioBitrate,
         "-hls_time", "10",
         "-hls_playlist_type", "vod",
-        `-hls_segment_filename`, `"${segmentPattern}"`,
+        "-hls_segment_filename", `"${segmentPattern}"`,
         "-start_number", "0",
         `"${hlsPath}"`,
     ].join(" ");
 
-    console.log("  [FFmpeg] Running transcoding...");
+    console.log(`  [FFmpeg] Starting ${label} transcoding...`);
     await execAsync(cmd);
-    console.log("  [FFmpeg] Transcoding complete.");
+    console.log(`  [FFmpeg] ${label} done.`);
 }
 
-// ─── Main poll loop ─────────────────────────────────────────────────────────
+/**
+ * Generate a master HLS playlist (master.m3u8) that references all quality renditions.
+ * This is what the Video.js player should load — it auto-switches quality based on bandwidth.
+ */
+function generateMasterPlaylist(qualities) {
+    const lines = ["#EXTM3U", "#EXT-X-VERSION:3", ""];
+
+    for (const q of qualities) {
+        lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${q.bandwidth},RESOLUTION=${q.resolution},NAME="${q.label}"`);
+        lines.push(`${q.label}/index.m3u8`);
+        lines.push("");
+    }
+
+    return lines.join("\n");
+}
+
+// ─── Main job processor ─────────────────────────────────────────────────────
 
 async function processJob(message) {
     const body = JSON.parse(message.Body);
@@ -98,20 +150,45 @@ async function processJob(message) {
         await downloadFromS3(bucket || RAW_BUCKET, s3Key, tmpInput);
         console.log("  [S3] Download complete.");
 
-        // 2. Transcode with FFmpeg
-        await transcodeToHLS(tmpInput, tmpOutputDir);
+        // 2. Transcode all qualities in parallel
+        console.log(`  [FFmpeg] Transcoding ${QUALITIES.length} quality renditions in parallel...`);
+        await Promise.all(
+            QUALITIES.map(q => transcodeQuality(tmpInput, tmpOutputDir, q))
+        );
+        console.log("  [FFmpeg] All renditions complete.");
 
-        // 3. Upload HLS output to processed bucket
-        console.log("  [S3] Uploading HLS segments...");
-        await uploadDirectoryToS3(tmpOutputDir, PROCESSED_BUCKET, `hls/${videoId}`);
-        console.log(`  [S3] Upload complete. Stream at: hls/${videoId}/index.m3u8`);
+        // 3. Generate and save master playlist locally
+        const masterContent = generateMasterPlaylist(QUALITIES);
+        const masterPath = path.join(tmpOutputDir, "master.m3u8");
+        fs.writeFileSync(masterPath, masterContent);
+        console.log("  [Playlist] master.m3u8 generated.");
+
+        // 4. Upload each quality folder to S3
+        for (const q of QUALITIES) {
+            const qualityDir = path.join(tmpOutputDir, q.label);
+            const s3Prefix = `hls/${videoId}/${q.label}`;
+            console.log(`  [S3] Uploading ${q.label} segments...`);
+            await uploadDirectoryToS3(qualityDir, PROCESSED_BUCKET, s3Prefix);
+        }
+
+        // 5. Upload master playlist to S3
+        await s3.send(new PutObjectCommand({
+            Bucket: PROCESSED_BUCKET,
+            Key: `hls/${videoId}/master.m3u8`,
+            Body: fs.readFileSync(masterPath),
+            ContentType: "application/x-mpegURL",
+        }));
+        console.log(`  [S3] master.m3u8 uploaded.`);
+        console.log(`\n  ✅ Done! Stream at: hls/${videoId}/master.m3u8`);
 
     } finally {
-        // 4. Clean up temp files (always, even on error)
+        // Always clean up temp files
         try { fs.rmSync(tmpInput, { force: true }); } catch (_) {}
         try { fs.rmSync(tmpOutputDir, { recursive: true, force: true }); } catch (_) {}
     }
 }
+
+// ─── SQS poll loop ──────────────────────────────────────────────────────────
 
 async function poll() {
     console.log("[Worker] Polling SQS for jobs...");
@@ -121,39 +198,36 @@ async function poll() {
             response = await sqs.send(new ReceiveMessageCommand({
                 QueueUrl: QUEUE_URL,
                 MaxNumberOfMessages: 1,
-                WaitTimeSeconds: 20,   // long-polling — avoids tight spin loops
+                WaitTimeSeconds: 20,
             }));
         } catch (err) {
             console.error("[Worker] SQS receive error:", err.message);
-            await new Promise(r => setTimeout(r, 5000));  // back-off before retry
+            await new Promise(r => setTimeout(r, 5000));
             continue;
         }
 
         const messages = response.Messages || [];
-        if (messages.length === 0) {
-            // No messages — loop back immediately (long-poll already waited 20s)
-            continue;
-        }
+        if (messages.length === 0) continue;
 
         const msg = messages[0];
         try {
             await processJob(msg);
 
-            // 5. Delete message from SQS only on success
             await sqs.send(new DeleteMessageCommand({
                 QueueUrl: QUEUE_URL,
                 ReceiptHandle: msg.ReceiptHandle,
             }));
-            console.log("[Worker] Job done — SQS message deleted.");
+            console.log("[Worker] SQS message deleted.\n");
 
         } catch (err) {
             console.error("[Worker] Job failed:", err.message);
-            // Don't delete — SQS will make it visible again after visibility timeout
+            // Don't delete — SQS will retry after visibility timeout
         }
     }
 }
 
-// Validate required env vars before starting
+// ─── Startup ─────────────────────────────────────────────────────────────────
+
 const required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "SQS_QUEUE_URL", "S3_RAW_BUCKET", "S3_PROCESSED_BUCKET"];
 const missing = required.filter(k => !process.env[k]);
 if (missing.length) {

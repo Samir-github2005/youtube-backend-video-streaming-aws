@@ -71,15 +71,16 @@ async function uploadDirectoryToS3(localDir, bucket, s3Prefix) {
         const fileBody = fs.readFileSync(filePath);
         const s3Key = `${s3Prefix}/${file}`;
 
-        const contentType = file.endsWith(".m3u8")
-            ? "application/x-mpegURL"
-            : "video/mp2t";
+        const isPlaylist = file.endsWith(".m3u8");
+        const contentType = isPlaylist ? "application/x-mpegURL" : "video/mp2t";
 
         await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: s3Key,
             Body: fileBody,
             ContentType: contentType,
+            // Playlists must never be cached — segments are immutable and can be cached long
+            CacheControl: isPlaylist ? "no-store" : "public, max-age=31536000, immutable",
         }));
         console.log(`  [S3] Uploaded: s3://${bucket}/${s3Key}`);
     }
@@ -125,7 +126,9 @@ function generateMasterPlaylist(qualities) {
     const lines = ["#EXTM3U", "#EXT-X-VERSION:3", ""];
 
     for (const q of qualities) {
-        lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${q.bandwidth},RESOLUTION=${q.resolution},NAME="${q.label}"`);
+        // NAME must NOT be quoted — some HLS parsers (including hls.js used by video.js)
+        // reject quoted values for NAME and silently fall back to the first stream only
+        lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${q.bandwidth},RESOLUTION=${q.resolution},NAME=${q.label}`);
         lines.push(`${q.label}/index.m3u8`);
         lines.push("");
     }
@@ -171,20 +174,21 @@ async function processJob(message) {
             await uploadDirectoryToS3(qualityDir, PROCESSED_BUCKET, s3Prefix);
         }
 
-        // 5. Upload master playlist to S3
+        // 5. Upload master playlist to S3 (never cache — it's the entry point)
         await s3.send(new PutObjectCommand({
             Bucket: PROCESSED_BUCKET,
             Key: `hls/${videoId}/master.m3u8`,
             Body: fs.readFileSync(masterPath),
             ContentType: "application/x-mpegURL",
+            CacheControl: "no-store",
         }));
         console.log(`  [S3] master.m3u8 uploaded.`);
         console.log(`\n  ✅ Done! Stream at: hls/${videoId}/master.m3u8`);
 
     } finally {
         // Always clean up temp files
-        try { fs.rmSync(tmpInput, { force: true }); } catch (_) {}
-        try { fs.rmSync(tmpOutputDir, { recursive: true, force: true }); } catch (_) {}
+        try { fs.rmSync(tmpInput, { force: true }); } catch (_) { }
+        try { fs.rmSync(tmpOutputDir, { recursive: true, force: true }); } catch (_) { }
     }
 }
 

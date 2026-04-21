@@ -1,6 +1,7 @@
 // App.jsx
 import { useState } from 'react';
 import VideoPlayer from './VideoPlayer';
+import 'videojs-hls-quality-selector/dist/videojs-hls-quality-selector.css';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 const CF_URL = import.meta.env.VITE_CLOUDFRONT_URL;
@@ -88,6 +89,12 @@ export default function App() {
             autoplay: true,
             responsive: true,
             fluid: true,
+            html5: {
+              vhs: {
+                enableLowLatency: true,
+                overrideNative: true,
+              }
+            },
             sources: [{ src: hlsUrl, type: 'application/x-mpegURL' }],
           }}
         />

@@ -348,7 +348,7 @@ To resume:
 
 ## 🛣️ Roadmap / Next Steps
 
-- [ ] Multiple resolution outputs (360p, 480p, 720p, 1080p) from a single upload
+- [ ] Multiple resolution outputs (480p, 720p, 1080p) from a single upload
 - [ ] Progress bar during transcoding
 - [ ] Host the Express API on EC2 or ECS (currently local only)
 - [ ] Add user authentication

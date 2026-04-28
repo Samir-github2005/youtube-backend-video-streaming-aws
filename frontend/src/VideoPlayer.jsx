@@ -1,72 +1,89 @@
-import React from 'react';
-import videojs from 'video.js';
-import 'video.js/dist/video-js.css';
-import 'videojs-contrib-quality-levels';
-import 'videojs-hls-quality-selector';
+import { useRef, useEffect, useState } from 'react';
+import Hls from 'hls.js';
 
-export const VideoPlayer = (props) => {
-  const videoRef = React.useRef(null);
-  const playerRef = React.useRef(null);
-  const {options, onReady} = props;
+export default function VideoPlayer({ src }) {
+  const videoRef = useRef(null);
+  const hlsRef = useRef(null);
+  const [levels, setLevels] = useState([]);
+  const [currentLevel, setCurrentLevel] = useState(-1); // -1 = Auto
+  const [menuOpen, setMenuOpen] = useState(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !src) return;
 
-    // Make sure Video.js player is only initialized once
-    if (!playerRef.current) {
-      const videoElement = document.createElement("video-js");
-      videoElement.classList.add('vjs-big-play-centered');
-      videoRef.current.appendChild(videoElement);
+    if (Hls.isSupported()) {
+      const hls = new Hls();
+      hlsRef.current = hls;
 
-      const player = playerRef.current = videojs(videoElement, options, () => {
-        videojs.log('player is ready');
-        onReady && onReady(player);
+      hls.loadSource(src);
+      hls.attachMedia(video);
 
-        // Wait for hls.js to finish parsing the master playlist and populate
-        // quality levels before initialising the selector — avoids the bug
-        // where only the first variant (480p) appears in the menu.
-        const qualityLevels = player.qualityLevels();
-
-        const initSelector = () => {
-          videojs.log(`[QualitySelector] ${qualityLevels.length} level(s) detected — initialising selector`);
-          player.hlsQualitySelector({ displayCurrentQuality: true });
-        };
-
-        if (qualityLevels.length > 0) {
-          // Levels already loaded (cached / fast connection)
-          initSelector();
-        } else {
-          // Listen for the first quality level to be added, then init
-          qualityLevels.on('addqualitylevel', function onAdd() {
-            qualityLevels.off('addqualitylevel', onAdd);
-            initSelector();
-          });
-        }
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setLevels(hls.levels);
+        video.play().catch(() => {});
       });
 
-    } else {
-      const player = playerRef.current;
-      player.autoplay(options.autoplay);
-      player.src(options.sources);
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+        setCurrentLevel(data.level);
+      });
+
+      return () => {
+        hls.destroy();
+        hlsRef.current = null;
+      };
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS
+      video.src = src;
+      video.addEventListener('loadedmetadata', () => video.play());
     }
-  }, [options, videoRef]);
+  }, [src]);
 
-  // Dispose the Video.js player when the functional component unmounts
-  React.useEffect(() => {
-    const player = playerRef.current;
+  const switchQuality = (levelIndex) => {
+    if (!hlsRef.current) return;
+    hlsRef.current.currentLevel = levelIndex; // -1 = auto
+    setCurrentLevel(levelIndex);
+    setMenuOpen(false);
+  };
 
-    return () => {
-      if (player && !player.isDisposed()) {
-        player.dispose();
-        playerRef.current = null;
-      }
-    };
-  }, [playerRef]);
+  const activeLabel =
+    currentLevel === -1 ? 'Auto' : `${levels[currentLevel]?.height}p`;
 
   return (
-    <div data-vjs-player>
-      <div ref={videoRef} />
+    <div className="hls-player-wrap">
+      <video ref={videoRef} controls />
+
+      {levels.length > 1 && (
+        <div className="quality-menu">
+          <button
+            className="quality-menu__toggle"
+            onClick={() => setMenuOpen((o) => !o)}
+            title="Quality"
+          >
+            ⚙ {activeLabel}
+          </button>
+
+          {menuOpen && (
+            <div className="quality-menu__list">
+              <button
+                className={currentLevel === -1 ? 'active' : ''}
+                onClick={() => switchQuality(-1)}
+              >
+                Auto
+              </button>
+              {levels.map((lvl, i) => (
+                <button
+                  key={i}
+                  className={currentLevel === i ? 'active' : ''}
+                  onClick={() => switchQuality(i)}
+                >
+                  {lvl.height}p
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
-
-export default VideoPlayer;

@@ -1,13 +1,17 @@
 import dotenv from "dotenv";
 dotenv.config();
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from "@aws-sdk/client-sqs";
 import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
 import path from "path";
+import https from "https";
+import http from "http";
 
 const execAsync = promisify(exec);
+
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3000";
 
 const REGION = process.env.AWS_REGION || "ap-south-1";
 const credentials = {
@@ -33,6 +37,7 @@ const QUALITIES = [
         videoBitrate: "800k",
         audioBitrate: "96k",
         bandwidth: 896000,       // videoBitrate + audioBitrate in bps
+        codecs: "avc1.640028,mp4a.40.2",
     },
     {
         label: "720p",
@@ -40,6 +45,7 @@ const QUALITIES = [
         videoBitrate: "2500k",
         audioBitrate: "128k",
         bandwidth: 2628000,
+        codecs: "avc1.640028,mp4a.40.2",
     },
     {
         label: "1080p",
@@ -47,6 +53,7 @@ const QUALITIES = [
         videoBitrate: "5000k",
         audioBitrate: "192k",
         bandwidth: 5192000,
+        codecs: "avc1.640028,mp4a.40.2",
     },
 ];
 
@@ -104,6 +111,8 @@ async function transcodeQuality(inputPath, outputDir, quality) {
         "-vf", `scale=${resolution}`,   // force exact resolution
         "-c:v", "libx264",
         "-b:v", videoBitrate,
+        "-force_key_frames", `"expr:gte(t,n_forced*2)"`,
+        "-sc_threshold", "0",
         "-c:a", "aac",
         "-b:a", audioBitrate,
         "-hls_time", "10",
@@ -128,12 +137,44 @@ function generateMasterPlaylist(qualities) {
     for (const q of qualities) {
         // NAME must NOT be quoted — some HLS parsers (including hls.js used by video.js)
         // reject quoted values for NAME and silently fall back to the first stream only
-        lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${q.bandwidth},RESOLUTION=${q.resolution},NAME=${q.label}`);
+        lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${q.bandwidth},RESOLUTION=${q.resolution},CODECS="${q.codecs}",NAME=${q.label}`);
         lines.push(`${q.label}/index.m3u8`);
         lines.push("");
     }
 
     return lines.join("\n");
+}
+
+// ─── Mark video as ready in DynamoDB via the backend API ────────────────────
+
+async function markReady(videoId) {
+    return new Promise((resolve, reject) => {
+        const url = new URL(`${BACKEND_URL}/videos/${videoId}/status`);
+        const client = url.protocol === 'https:' ? https : http;
+
+        const body = JSON.stringify({ status: 'ready' });
+        const req = client.request(url, {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    console.log(`  [Backend] DynamoDB status updated to ready for videoId=${videoId}`);
+                    resolve();
+                } else {
+                    reject(new Error(`PATCH /videos/${videoId}/status returned HTTP ${res.statusCode}: ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
 }
 
 // ─── Main job processor ─────────────────────────────────────────────────────
@@ -143,6 +184,23 @@ async function processJob(message) {
     const { videoId, s3Key, bucket } = body;
 
     console.log(`\n[Worker] Received job — videoId=${videoId}, key=${s3Key}`);
+
+    // ── Idempotency guard ──────────────────────────────────────────────────────
+    // If master.m3u8 already exists on S3 this job was already completed
+    // (e.g. SQS retried after a markReady failure). Skip re-transcoding.
+    try {
+        await s3.send(new HeadObjectCommand({
+            Bucket: PROCESSED_BUCKET,
+            Key: `hls/${videoId}/master.m3u8`,
+        }));
+        console.log(`  [Worker] master.m3u8 already on S3 — skipping transcode for videoId=${videoId}`);
+        return; // nothing to do; poll() will still call markReady and delete the SQS message
+    } catch (headErr) {
+        // 404 = not yet processed, continue normally
+        const is404 = headErr.name === 'NotFound' || headErr.$metadata?.httpStatusCode === 404;
+        if (!is404) throw headErr; // unexpected S3 error — let poll() handle it
+    }
+    // ──────────────────────────────────────────────────────────────────────────
 
     const tmpInput = `/tmp/${videoId}.mp4`;
     const tmpOutputDir = `/tmp/${videoId}`;
@@ -183,7 +241,7 @@ async function processJob(message) {
             CacheControl: "no-store",
         }));
         console.log(`  [S3] master.m3u8 uploaded.`);
-        console.log(`\n  ✅ Done! Stream at: hls/${videoId}/master.m3u8`);
+        console.log(`\n  ✅ Transcode complete! Stream at: hls/${videoId}/master.m3u8`);
 
     } finally {
         // Always clean up temp files
@@ -214,18 +272,39 @@ async function poll() {
         if (messages.length === 0) continue;
 
         const msg = messages[0];
+        const { videoId } = JSON.parse(msg.Body);
+
+        // ── Step 1: Transcode + upload to S3 ──────────────────────────────────
+        // Only re-queue (skip delete) if transcoding itself fails.
         try {
             await processJob(msg);
+        } catch (err) {
+            console.error(`[Worker] Transcode failed for videoId=${videoId}:`, err.message);
+            // Leave message in SQS — it will become visible again after visibility timeout
+            continue;
+        }
 
+        // ── Step 2: Delete the SQS message ────────────────────────────────────
+        // Do this immediately after successful transcode so SQS never retries it,
+        // even if the DynamoDB update below fails.
+        try {
             await sqs.send(new DeleteMessageCommand({
                 QueueUrl: QUEUE_URL,
                 ReceiptHandle: msg.ReceiptHandle,
             }));
-            console.log("[Worker] SQS message deleted.\n");
-
+            console.log("[Worker] SQS message deleted.");
         } catch (err) {
-            console.error("[Worker] Job failed:", err.message);
-            // Don't delete — SQS will retry after visibility timeout
+            console.error("[Worker] Failed to delete SQS message (will retry on next poll):", err.message);
+        }
+
+        // ── Step 3: Update DynamoDB status → ready ────────────────────────────
+        // Failure here does NOT cause re-transcoding — the SQS message is already gone.
+        try {
+            await markReady(videoId);
+            console.log(`[Worker] Done ✅ videoId=${videoId}\n`);
+        } catch (err) {
+            console.error(`[Worker] markReady failed for videoId=${videoId}:`, err.message);
+            console.error("  → HLS is on S3 but DynamoDB status was NOT updated. Fix manually via PATCH /videos/:id/status");
         }
     }
 }

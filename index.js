@@ -8,7 +8,8 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
-
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 
 const app = express();
 const PORT = 3000;
@@ -20,6 +21,10 @@ const s3 = new S3Client({
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     },
 });
+
+const dynamo = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION })
+);
 
 const sqs = new SQSClient({
     region: process.env.AWS_REGION || "ap-south-1",
@@ -84,6 +89,18 @@ app.post("/upload", (req, res) => {
             return res.status(500).json({ error: "Upload succeeded but failed to queue job", detail: sqsErr.message });
         }
 
+        // Save to DynamoDB
+        await dynamo.send(new PutCommand({
+            TableName: process.env.DYNAMO_TABLE,
+            Item:{
+                videoId,
+                title: req.body.title ,
+                description: req.body.description,
+                status: 'processing',
+                createdAt: new Date().toISOString()
+            }
+        }))
+
         res.json({
             message: "Upload successful, transcoding job queued",
             videoId,
@@ -92,6 +109,52 @@ app.post("/upload", (req, res) => {
         });
     });
 });
+
+app.get('/videos', async (req, res) => {
+  try {
+    const data = await dynamo.send(new ScanCommand({ TableName: process.env.DYNAMO_TABLE }));
+    const items = data.Items || [];
+
+    // For every video still marked 'processing', check S3 in parallel.
+    // If master.m3u8 already exists, flip DynamoDB to 'ready' immediately.
+    await Promise.all(
+      items
+        .filter(v => v.status === 'processing')
+        .map(async (v) => {
+          try {
+            await s3.send(new HeadObjectCommand({
+              Bucket: process.env.S3_PROCESSED_BUCKET,
+              Key: `hls/${v.videoId}/master.m3u8`,
+            }));
+
+            // File is on S3 — update DynamoDB and the in-memory item
+            await dynamo.send(new UpdateCommand({
+              TableName: process.env.DYNAMO_TABLE,
+              Key: { videoId: v.videoId },
+              UpdateExpression: 'SET #s = :s',
+              ExpressionAttributeNames: { '#s': 'status' },
+              ExpressionAttributeValues: { ':s': 'ready' },
+            }));
+
+            v.status = 'ready'; // reflect in the response without a second scan
+            console.log(`[Videos] Auto-reconciled videoId=${v.videoId} → ready`);
+          } catch (err) {
+            const is404 = err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404;
+            if (!is404) {
+              console.error(`[Videos] Reconcile error for videoId=${v.videoId}:`, err.name, err.message, err.$metadata);
+            }
+            // still processing or an unexpected error — leave status as-is
+          }
+        })
+    );
+
+    res.json(items);
+  } catch (err) {
+    console.error('[Videos] Error:', err.message);
+    res.status(500).json({ error: 'Failed to list videos' });
+  }
+});
+
 
 app.get('/status/:videoId', async (req, res) => {
   const { videoId } = req.params;
@@ -106,11 +169,37 @@ app.get('/status/:videoId', async (req, res) => {
     res.json({ status: 'ready' });
 
   } catch (err) {
-    if (err.name === 'NotFound') {
+    // AWS SDK v3 sends HTTP 404 as err.name='NotFound' OR err.$metadata.httpStatusCode=404
+    const is404 = err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404;
+    if (is404) {
       res.json({ status: 'processing' });
     } else {
+      console.error('[Status] Unexpected S3 error:', err.message);
       res.status(500).json({ status: 'failed' });
     }
+  }
+});
+
+// Worker calls this once HLS upload is complete
+app.patch('/videos/:videoId/status', async (req, res) => {
+  const { videoId } = req.params;
+  const { status } = req.body;
+
+  if (!status) return res.status(400).json({ error: 'status is required' });
+
+  try {
+    await dynamo.send(new UpdateCommand({
+      TableName: process.env.DYNAMO_TABLE,
+      Key: { videoId },
+      UpdateExpression: 'SET #s = :s',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':s': status },
+    }));
+    console.log(`[PATCH] videoId=${videoId} status set to ${status}`);
+    res.json({ ok: true, videoId, status });
+  } catch (err) {
+    console.error('[PATCH] DynamoDB update error:', err.message);
+    res.status(500).json({ error: 'Failed to update status', detail: err.message });
   }
 });
 
